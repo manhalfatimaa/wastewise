@@ -1,157 +1,299 @@
 import streamlit as st
 import pandas as pd
 from datetime import date, timedelta
+import io
 
-st.set_page_config(page_title="WasteWise", page_icon="🌱", layout="wide")
-st.markdown("""<style>.block-container{padding-top:2rem;}[data-testid='stMetric']{background:#f1f8f2;border-radius:12px;padding:14px;}</style>""", unsafe_allow_html=True)
+st.set_page_config(
+    page_title="WasteWise | Campus Food Waste Dashboard",
+    page_icon="♻️",
+    layout="wide"
+)
 
-DEMO = [
-    ("Chicken Sandwich", 70, 56, 9, 130),
-    ("Biryani", 90, 78, 8, 170),
-    ("Samosa", 120, 98, 18, 35),
-    ("Pasta", 55, 42, 10, 155),
+APP_DATA_VERSION = 3
+
+# ----------------------------
+# Sample data (illustrative)
+# ----------------------------
+DEMO_ITEMS = [
+    {"item": "Chicken Sandwich", "prepared": 70, "sold": 56, "discarded": 9, "cost": 130, "price": 200},
+    {"item": "Biryani", "prepared": 90, "sold": 78, "discarded": 8, "cost": 170, "price": 250},
+    {"item": "Samosa", "prepared": 120, "sold": 98, "discarded": 18, "cost": 35, "price": 60},
+    {"item": "Pasta", "prepared": 55, "sold": 42, "discarded": 10, "cost": 155, "price": 220},
 ]
 
-def demo_data():
+def make_demo_data():
     rows = []
+    today = date.today()
     for days_ago in range(6, -1, -1):
-        day = date.today() - timedelta(days=days_ago)
-        for i, (item, made, sold, discarded, cost) in enumerate(DEMO):
+        for i, item in enumerate(DEMO_ITEMS):
             adjustment = ((days_ago * 3 + i * 2) % 9) - 4
-            qty_made = made + adjustment
-            qty_sold = min(qty_made, sold + adjustment // 2)
-            qty_discarded = min(qty_made - qty_sold, discarded)
-            rows.append({"Date": day, "Food Item": item, "Prepared": qty_made,
-                         "Sold": qty_sold, "Discarded": qty_discarded,
-                         "Cost per Portion (PKR)": cost})
+            prepared = max(0, item["prepared"] + adjustment)
+            sold = max(0, min(prepared, item["sold"] + adjustment // 2))
+            discarded = max(0, min(prepared - sold, item["discarded"]))
+            rows.append({
+                "Date": today - timedelta(days=days_ago),
+                "Food Item": item["item"],
+                "Prepared": prepared,
+                "Sold": sold,
+                "Discarded": discarded,
+                "Cost per Portion (PKR)": item["cost"],
+                "Selling Price (PKR)": item["price"],
+            })
     return pd.DataFrame(rows)
 
-if "records" not in st.session_state:
-    st.session_state.records = demo_data()
+REQUIRED_COLUMNS = [
+    "Date", "Food Item", "Prepared", "Sold", "Discarded",
+    "Cost per Portion (PKR)", "Selling Price (PKR)"
+]
 
-st.title("🌱 WasteWise")
-st.caption("Smarter Cafeterias • Less Waste • Better Business Decisions")
-st.info("DEMO MODE: Initial records are fictional examples, not observations from a real cafeteria. Changes are kept only in this browser session. Export your data to save it.")
+def clean_records(df):
+    df = df.copy()
+    # Older CSV files may not have a selling-price column.
+    if "Selling Price (PKR)" not in df.columns:
+        df["Selling Price (PKR)"] = pd.NA
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            if col == "Date":
+                df[col] = date.today()
+            elif col == "Food Item":
+                df[col] = "Unknown item"
+            else:
+                df[col] = pd.NA
+    df = df[REQUIRED_COLUMNS]
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    for col in ["Prepared", "Sold", "Discarded", "Cost per Portion (PKR)", "Selling Price (PKR)"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["Food Item"] = df["Food Item"].fillna("Unknown item").astype(str)
+    df = df.dropna(subset=["Date", "Prepared", "Sold", "Discarded", "Cost per Portion (PKR)"])
+    return df.reset_index(drop=True)
 
-with st.sidebar:
-    st.header("Navigation")
-    page = st.radio("Go to", ["Overview", "Log Food", "Smart Recommendations", "Savings Simulator", "ESG Report"])
-    st.divider()
-    if st.button("Reset to sample data"):
-        st.session_state.records = demo_data()
-        st.rerun()
-    uploaded = st.file_uploader("Import previously exported CSV", type="csv")
-    if uploaded is not None and st.button("Load CSV"):
+def add_calculations(df):
+    out = df.copy()
+    numeric_cols = ["Prepared", "Sold", "Discarded", "Cost per Portion (PKR)", "Selling Price (PKR)"]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out["Unsold"] = (out["Prepared"] - out["Sold"]).clip(lower=0)
+    out["Discard Cost (PKR)"] = out["Discarded"] * out["Cost per Portion (PKR)"]
+    out["Unsold Cost (PKR)"] = out["Unsold"] * out["Cost per Portion (PKR)"]
+    out["Sales Revenue (PKR)"] = out["Sold"] * out["Selling Price (PKR)"]
+    out["Production Cost of Sold Portions (PKR)"] = out["Sold"] * out["Cost per Portion (PKR)"]
+    out["Gross Contribution (PKR)"] = (
+        out["Sales Revenue (PKR)"] - out["Production Cost of Sold Portions (PKR)"]
+    )
+    return out
+
+# ----------------------------
+# Session data and reset logic
+# ----------------------------
+# Version 3 deliberately replaces the old in-session demo dataset once.
+if st.session_state.get("data_version") != APP_DATA_VERSION:
+    st.session_state.records = make_demo_data()
+    st.session_state.data_version = APP_DATA_VERSION
+elif "records" not in st.session_state:
+    st.session_state.records = make_demo_data()
+
+st.title("♻️ WasteWise")
+st.caption("A smart food-waste and business decision dashboard for campus cafeterias.")
+st.info(
+    "Demo mode: the preloaded figures and prices are illustrative sample data, "
+    "not verified records or prices from the campus cafeteria."
+)
+
+# Sidebar controls
+st.sidebar.title("WasteWise Controls")
+page = st.sidebar.radio(
+    "Navigate",
+    ["Overview", "Log Food", "Smart Recommendations", "Savings Simulator", "ESG Report"]
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("Data management")
+
+if st.sidebar.button("Replace all records with latest demo data", use_container_width=True):
+    st.session_state.records = make_demo_data()
+    st.session_state.data_version = APP_DATA_VERSION
+    st.rerun()
+
+if st.sidebar.button("Clear all records", use_container_width=True):
+    st.session_state.records = pd.DataFrame(columns=REQUIRED_COLUMNS)
+    st.session_state.data_version = APP_DATA_VERSION
+    st.rerun()
+
+uploaded_file = st.sidebar.file_uploader("Import records from CSV", type=["csv"])
+if uploaded_file is not None:
+    if st.sidebar.button("Replace records with uploaded CSV", use_container_width=True):
         try:
-            df = pd.read_csv(uploaded)
-            required = ["Date", "Food Item", "Prepared", "Sold", "Discarded", "Cost per Portion (PKR)"]
-            if not all(c in df.columns for c in required):
-                raise ValueError("CSV does not have the required columns")
-            for col in ["Prepared", "Sold", "Discarded", "Cost per Portion (PKR)"]:
-                df[col] = pd.to_numeric(df[col], errors="raise")
-            df["Date"] = pd.to_datetime(df["Date"], errors="raise").dt.date
-            if (df[["Prepared", "Sold", "Discarded", "Cost per Portion (PKR)"]] < 0).any().any():
-                raise ValueError("Negative values are not allowed")
-            if ((df["Sold"] + df["Discarded"]) > df["Prepared"]).any():
-                raise ValueError("Sold + discarded cannot exceed prepared")
-            st.session_state.records = df[required]
-            st.success("Records loaded")
+            imported = pd.read_csv(uploaded_file)
+            st.session_state.records = clean_records(imported)
+            st.session_state.data_version = APP_DATA_VERSION
+            st.sidebar.success(f"Imported {len(st.session_state.records)} rows.")
             st.rerun()
         except Exception as exc:
-            st.error(f"Unable to load file: {exc}")
+            st.sidebar.error(f"Could not import this CSV: {exc}")
 
-records = st.session_state.records.copy()
-records["Unsold"] = records["Prepared"] - records["Sold"]
-records["Discard Cost"] = records["Discarded"] * records["Cost per Portion (PKR)"]
-records["Unsold Cost"] = records["Unsold"] * records["Cost per Portion (PKR)"]
+st.sidebar.caption("Export your records before clearing or replacing them.")
+
+records = clean_records(st.session_state.records)
+st.session_state.records = records
+calculated = add_calculations(records)
+
+# ----------------------------
+# Shared metrics
+# ----------------------------
+def money(value):
+    if pd.isna(value):
+        return "—"
+    return f"PKR {value:,.0f}"
+
+def show_empty_message():
+    st.warning("There are no records yet. Add food records on the Log Food page or import a CSV.")
 
 if page == "Overview":
-    st.subheader("Cafeteria Performance Overview")
-    a, b, c, d = st.columns(4)
-    a.metric("Portions Prepared", f"{int(records['Prepared'].sum()):,}")
-    b.metric("Portions Discarded", f"{int(records['Discarded'].sum()):,}")
-    c.metric("Discarded Production Cost", f"Rs. {records['Discard Cost'].sum():,.0f}")
-    rate = records["Discarded"].sum() / records["Prepared"].sum() * 100 if records["Prepared"].sum() else 0
-    d.metric("Discard Rate", f"{rate:.1f}%")
-    left, right = st.columns(2)
-    with left:
-        st.markdown("#### Discarded Portions by Food")
-        st.bar_chart(records.groupby("Food Item")["Discarded"].sum())
-    with right:
-        st.markdown("#### Daily Discarded Production Cost")
-        daily = records.groupby("Date")["Discard Cost"].sum()
-        st.line_chart(daily)
-    st.caption("Discarded production cost = discarded portions × estimated production cost per portion. This is not the same as lost sales revenue.")
+    st.header("Overview")
+    if records.empty:
+        show_empty_message()
+    else:
+        total_prepared = records["Prepared"].sum()
+        total_sold = records["Sold"].sum()
+        total_discarded = records["Discarded"].sum()
+        discard_rate = (total_discarded / total_prepared * 100) if total_prepared else 0
+        priced = calculated.dropna(subset=["Selling Price (PKR)"])
+        revenue = priced["Sales Revenue (PKR)"].sum()
+        contribution = priced["Gross Contribution (PKR)"].sum()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Portions prepared", f"{total_prepared:,.0f}")
+        c2.metric("Portions sold", f"{total_sold:,.0f}")
+        c3.metric("Portions discarded", f"{total_discarded:,.0f}")
+        c4.metric("Discard rate", f"{discard_rate:.1f}%")
+
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Discarded food cost", money(calculated["Discard Cost (PKR)"].sum()))
+        c6.metric("Sales revenue*", money(revenue))
+        c7.metric("Gross contribution*", money(contribution))
+        st.caption("*Revenue and gross contribution include only records with a selling price. Gross contribution is not net profit; overheads and other expenses are not deducted.")
+
+        st.subheader("Daily food-waste trend")
+        daily = records.groupby("Date", as_index=False)[["Prepared", "Sold", "Discarded"]].sum()
+        daily = daily.sort_values("Date").set_index("Date")
+        st.line_chart(daily[["Prepared", "Sold", "Discarded"]])
+
+        st.subheader("Records")
+        st.dataframe(calculated, use_container_width=True, hide_index=True)
+
+        csv_bytes = records.to_csv(index=False).encode("utf-8")
+        st.download_button("Download records as CSV", csv_bytes, "wastewise_records.csv", "text/csv")
 
 elif page == "Log Food":
-    st.subheader("Add a Daily Food Record")
-    with st.form("food_form", clear_on_submit=True):
-        food_date = st.date_input("Date", value=date.today())
-        item = st.text_input("Food item", placeholder="e.g., Chicken Sandwich")
-        a, b, c = st.columns(3)
-        made = a.number_input("Portions prepared", min_value=0, step=1)
-        sold = b.number_input("Portions sold", min_value=0, step=1)
-        discarded = c.number_input("Portions discarded", min_value=0, step=1)
-        cost = st.number_input("Production cost per portion (PKR)", min_value=0.0, step=5.0)
-        submitted = st.form_submit_button("Add Record", type="primary")
+    st.header("Log Food")
+    st.write("Enter one food item's daily figures. Use actual cafeteria observations when available.")
+    with st.form("food_entry_form", clear_on_submit=True):
+        selected_date = st.date_input("Date", value=date.today())
+        item_name = st.text_input("Food item", placeholder="e.g. Chicken sandwich")
+        col1, col2, col3 = st.columns(3)
+        prepared = col1.number_input("Portions prepared", min_value=0, step=1)
+        sold = col2.number_input("Portions sold", min_value=0, step=1)
+        discarded = col3.number_input("Portions discarded", min_value=0, step=1)
+        col4, col5 = st.columns(2)
+        cost = col4.number_input("Cost per portion (PKR)", min_value=0.0, step=5.0)
+        has_price = st.checkbox("I know the selling price")
+        price = col5.number_input("Selling price per portion (PKR)", min_value=0.0, step=5.0, disabled=not has_price)
+        submitted = st.form_submit_button("Save food record", type="primary")
+
         if submitted:
-            if not item.strip():
-                st.error("Please enter a food item")
-            elif sold + discarded > made:
-                st.error("Sold plus discarded portions cannot exceed prepared portions")
+            if not item_name.strip():
+                st.error("Please enter a food item name.")
+            elif sold + discarded > prepared:
+                st.error("Sold portions plus discarded portions cannot exceed portions prepared.")
             else:
-                new = pd.DataFrame([{"Date": food_date, "Food Item": item.strip(), "Prepared": made,
-                    "Sold": sold, "Discarded": discarded, "Cost per Portion (PKR)": cost}])
-                st.session_state.records = pd.concat([st.session_state.records, new], ignore_index=True)
-                st.success("Record added. Open Overview to see updated results.")
-    st.markdown("#### Current Records")
-    st.dataframe(records, use_container_width=True, hide_index=True)
-    st.download_button("Download records as CSV", st.session_state.records.to_csv(index=False),
-                       file_name="wastewise_records.csv", mime="text/csv")
+                new_row = {
+                    "Date": selected_date,
+                    "Food Item": item_name.strip(),
+                    "Prepared": int(prepared),
+                    "Sold": int(sold),
+                    "Discarded": int(discarded),
+                    "Cost per Portion (PKR)": float(cost),
+                    "Selling Price (PKR)": float(price) if has_price else pd.NA,
+                }
+                st.session_state.records = pd.concat(
+                    [records, pd.DataFrame([new_row])], ignore_index=True
+                )
+                st.success("Record saved.")
+                st.rerun()
+
+    if not records.empty:
+        st.subheader("Current records")
+        st.dataframe(records, use_container_width=True, hide_index=True)
+        csv_bytes = records.to_csv(index=False).encode("utf-8")
+        st.download_button("Download current records", csv_bytes, "wastewise_records.csv", "text/csv")
 
 elif page == "Smart Recommendations":
-    st.subheader("Preparation Planning")
-    st.write("A simple baseline recommendation uses average sales for the most recent recorded days. It is not an AI forecast and cannot account for unexpected events.")
-    items = sorted(records["Food Item"].unique())
-    selected = st.selectbox("Choose food item", items)
-    buffer = st.slider("Safety buffer above average sales (%)", 0, 30, 10)
-    item_records = records[records["Food Item"] == selected].sort_values("Date")
-    recent = item_records.tail(7)
-    average = recent["Sold"].mean()
-    suggested = int(round(average * (1 + buffer / 100)))
-    x, y, z = st.columns(3)
-    x.metric("Average Sales", f"{average:.1f} portions")
-    y.metric("Suggested Next Preparation", f"{suggested} portions")
-    z.metric("Recent Discarded Portions", f"{int(recent['Discarded'].sum())}")
-    st.line_chart(item_records.set_index("Date")[["Prepared", "Sold", "Discarded"]])
-    st.warning("Use this as a planning estimate only. Validate against weekdays, exam schedules, stock-outs, and cafeteria manager feedback before acting.")
+    st.header("Smart Recommendations")
+    st.caption("These are simple data-based planning suggestions, not AI predictions.")
+    if records.empty:
+        show_empty_message()
+    else:
+        item_summary = records.groupby("Food Item").agg(
+            Average_Sold=("Sold", "mean"),
+            Average_Prepared=("Prepared", "mean"),
+            Total_Discarded=("Discarded", "sum")
+        ).reset_index()
+        buffer_pct = st.slider("Safety buffer above average sales (%)", 0, 30, 10)
+        item_summary["Suggested Preparation"] = (
+            item_summary["Average_Sold"] * (1 + buffer_pct / 100)
+        ).apply(lambda x: int(round(x)))
+        item_summary["Potential Check"] = item_summary.apply(
+            lambda r: "Review preparation level" if r["Total_Discarded"] > 0 else "Continue monitoring",
+            axis=1
+        )
+        st.dataframe(item_summary, use_container_width=True, hide_index=True)
+        st.write("Use these estimates as a starting point. Consider weekdays, events, weather and stock availability before changing production.")
 
 elif page == "Savings Simulator":
-    st.subheader("What If We Reduce Food Waste?")
-    reduction = st.slider("Hypothetical reduction in discarded portions (%)", 0, 75, 25)
-    current_cost = records["Discard Cost"].sum()
-    potential = current_cost * reduction / 100
-    a, b, c = st.columns(3)
-    a.metric("Current Recorded Discard Cost", f"Rs. {current_cost:,.0f}")
-    b.metric("Illustrative Avoidable Cost", f"Rs. {potential:,.0f}")
-    c.metric("Remaining Discard Cost", f"Rs. {current_cost - potential:,.0f}")
-    st.bar_chart(pd.DataFrame({"PKR": [current_cost, current_cost - potential]}, index=["Current", "Scenario"]))
-    st.caption("Scenario only, not a measured saving. Avoided production costs require actual operational changes; savings may be lower after implementation costs and other constraints.")
+    st.header("Savings Simulator")
+    st.write("Explore a hypothetical reduction in discarded portions. This is a scenario, not a measured result.")
+    if records.empty:
+        show_empty_message()
+    else:
+        current_discard = int(records["Discarded"].sum())
+        average_cost = (
+            (records["Discarded"] * records["Cost per Portion (PKR)"]).sum() / current_discard
+            if current_discard else 0
+        )
+        reduction = st.slider("Assumed reduction in food discarded (%)", 0, 100, 25)
+        avoided = current_discard * reduction / 100
+        estimated_saving = avoided * average_cost
+        a, b, c = st.columns(3)
+        a.metric("Current discarded portions", f"{current_discard:,.0f}")
+        b.metric("Potentially avoided portions", f"{avoided:,.1f}")
+        c.metric("Illustrative production-cost saving", money(estimated_saving))
+        st.caption("Estimate uses the average production cost of discarded portions. It is not a guaranteed cash saving.")
 
-else:
-    st.subheader("Environmental, Social & Governance Snapshot")
-    prepared = records["Prepared"].sum()
-    discarded = records["Discarded"].sum()
-    st.markdown("### 🌿 Environmental")
-    st.write(f"Recorded discarded portions: **{discarded:,.0f}** out of **{prepared:,.0f}** prepared.")
-    st.write("For defensible carbon estimates, collect food weights and use documented food-specific emissions factors. No unverified CO₂ estimate is shown.")
-    st.markdown("### 🤝 Social")
-    st.write("Possible goals: train cafeteria staff to record waste consistently, encourage responsible consumption, and explore safe surplus-food handling with management.")
-    st.markdown("### 🛡️ Governance")
-    st.write("Suggested controls: designated data owner, daily record review, weekly trend checks, documented assumptions, and management approval for operational changes.")
-    st.markdown("### 💰 Financial")
-    st.write(f"Estimated production cost of recorded discarded food: **Rs. {records['Discard Cost'].sum():,.0f}**.")
-    st.caption("All figures depend on input data quality. Sample data must not be presented as verified field research.")
+elif page == "ESG Report":
+    st.header("ESG Report")
+    st.write("A simple environmental, social and governance snapshot.")
+    if records.empty:
+        show_empty_message()
+    else:
+        total_prepared = records["Prepared"].sum()
+        total_discarded = records["Discarded"].sum()
+        rate = total_discarded / total_prepared * 100 if total_prepared else 0
+        st.metric("Food discard rate", f"{rate:.1f}%")
+        st.metric("Discarded portions recorded", f"{total_discarded:,.0f}")
+        st.subheader("ESG interpretation")
+        st.markdown("""
+        **Environmental:** Track discarded portions and their production cost. Weighing food waste would make the environmental measurement stronger.
 
-st.divider()
-st.caption("WasteWise | Student sustainability innovation prototype | Built with Streamlit")
+        **Social:** Consider safe donation of suitable surplus food, staff awareness and clear food-handling procedures.
+
+        **Governance:** Maintain dated records, consistent measurement methods and transparent reporting. Clearly distinguish observed data from estimates.
+        """)
+        st.subheader("Recommended evidence to collect")
+        st.markdown("""
+        - Daily prepared, sold and discarded quantities
+        - Actual ingredient or production cost per portion
+        - Selling price, if the cafeteria is willing to share it
+        - Waste weight in kilograms, if scales are available
+        - Date, measurement method and person recording the data
+        """)
+        st.warning("Do not report carbon-emission reductions unless you have a defensible waste-weight figure and a reliable conversion factor.")
